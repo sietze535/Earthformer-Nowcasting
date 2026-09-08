@@ -1,0 +1,77 @@
+# Dump / classical-baseline configs: same 2019 rainy test population as EarthFormer eval.
+dataloader:
+  module_path: nowcasting.data.dataloader_zarrv3.NowcastingDataModule
+  paths:
+  - ${oc.env:THESIS_DATA_ROOT}/radar_2008_2019_radar_only_v1.zarr
+  var_info:
+    sample_var: radar/max_intensity_grid
+    latlon: false
+    in_vars:
+    - radar/rtcor
+    out_vars:
+    - radar/rtcor
+    transforms:
+      radar:
+        default_rainrate:
+          mean: 0.03019706713265408
+          std: 0.5392297631902654
+  split_info:
+    split_rules:
+      val:
+        year:
+        - 2019
+      train:
+        year:
+        - 2008
+        - 2009
+        - 2010
+        - 2011
+        - 2012
+        - 2013
+        - 2014
+        - 2015
+        - 2016
+        - 2017
+    apply_missing_masks:
+    - radar
+    clutter_threshold: 50
+  sample_info:
+    threshold: 0.01
+    methods:
+      train:
+        agg: mean_pool
+        center_crop: true
+      val:
+        agg: mean_pool
+        center_crop: true
+    index_files:
+      train: ${oc.env:THESIS_INDEX_DIR}/train_100pct.npz
+      val: ${oc.env:THESIS_INDEX_DIR}/test_2019.npz
+  context_len: 4
+  forecast_len: 18
+  img_size:
+  - 8
+  - 8
+  stride:
+  - 4
+  - 1
+  - 1
+  batch_size: 8
+  num_workers: 4
+model:
+  module_path: nowcasting.benchmarks.pysteps.PySTEPSModel
+  method: sprog
+  future_timesteps: 18
+  km_per_pixel: 1.0
+  n_cascade_levels: 6
+  ar_order: 2
+  inputs_are_normalized: true
+  verbose: false
+  parallel: false
+eval:
+  model_name: thesis_baseline__sprog__test2019
+  num_samples: 32000
+  leadtimes: [5, 10, 15, 30, 60, 90]
+  thresholds: [0, 0.5, 1, 2, 5, 10, 20, 30]
+  save_dir: ./results
+  eval_subdir: evaluations

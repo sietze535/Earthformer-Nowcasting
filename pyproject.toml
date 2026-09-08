@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thesis-nowcasting"
+version = "0.1.0"
+description = "Minimal code release for KNMI radar nowcasting with EarthFormer (MSc thesis)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Sietze van der Vinne" }]
+dependencies = [
+  "numpy",
+  "numba",
+  "pandas",
+  "matplotlib",
+  "torch",
+  "torchvision",
+  "torchmetrics",
+  "einops",
+  "lightning",
+  "zarr",
+  "netcdf4",
+  "xarray",
+  "dask",
+  "fire",
+  "omegaconf",
+  "tqdm",
+  "h5py",
+  "scipy",
+  "scikit-image",
+  "tensorboard",
+  "codecarbon",
+  "requests",
+]
+
+[tool.setuptools.packages.find]
+include = ["nowcasting*"]

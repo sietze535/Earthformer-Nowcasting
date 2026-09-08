@@ -1,0 +1,323 @@
+import lightning as L
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
+import torchvision.utils
+
+import torchmetrics
+
+from .cuboid_transformer import CuboidTransformerModel
+from .utils.utils import get_parameter_names
+from .utils.optim import SequentialLR, warmup_lambda
+from ...utils import data_prep
+
+from ..losses import BalancedLoss, MultiSourceLoss, CombinedLoss, ExceedanceBCELoss
+
+torch.set_float32_matmul_precision('medium')
+
+MODEL_REGISTRY = {
+    "CuboidTransformerModel": CuboidTransformerModel,
+}
+
+class CuboidSEVIRPLModule(L.LightningModule):
+    """Lightning wrapper around CuboidTransformer for precipitation nowcasting."""
+    def __init__(self, config):
+        super(CuboidSEVIRPLModule, self).__init__()
+
+        self.config = config
+
+        model_class_name = self.config.model.pop('model_class', 'CuboidTransformerModel')
+        ModelClass = MODEL_REGISTRY[model_class_name]
+
+        self.torch_nn_module = ModelClass(
+            input_shape=self.config.model.pop('input_shape'),
+            target_shape=self.config.model.pop('target_shape'),
+            **self.config.model,
+        )
+
+        loss_name = self.config.loss.pop('loss_name', 'mse')
+        if loss_name == 'balanced':
+            self.criterion = BalancedLoss(**self.config.loss)
+        elif loss_name == 'combined':
+            self.criterion = CombinedLoss(**self.config.loss)
+        elif loss_name == 'multi-source':
+            self.criterion = MultiSourceLoss(**self.config.loss)
+        elif loss_name == 'exceedance_bce':
+            self.criterion = ExceedanceBCELoss(**self.config.loss)
+        else:
+            self.criterion = F.mse_loss
+
+        # Store multiple labeled visualization samples per epoch.
+        self.sample_images = {}
+
+        self.valid_r_mse = torchmetrics.MeanSquaredError()
+        self.valid_r_mae = torchmetrics.MeanAbsoluteError()
+        self.valid_r_csi_20mmh = torchmetrics.CriticalSuccessIndex(20.0)
+        
+
+    def configure_optimizers(self):
+        cfg = self.config.optimizer
+
+        # Configure the optimizer. Disable the weight decay for layer norm weights and all bias terms.
+        decay_parameters = get_parameter_names(self.torch_nn_module, [nn.LayerNorm])
+        decay_parameters = [name for name in decay_parameters if "bias" not in name]
+        optimizer_grouped_parameters = [{
+            'params': [p for n, p in self.torch_nn_module.named_parameters()
+                       if n in decay_parameters],
+            'weight_decay': cfg.weight_decay
+        }, {
+            'params': [p for n, p in self.torch_nn_module.named_parameters()
+                       if n not in decay_parameters],
+            'weight_decay': 0.0
+        }]
+
+        if cfg.method == 'adamw':
+            optimizer = torch.optim.AdamW(params=optimizer_grouped_parameters,
+                                          lr=cfg.lr,
+                                          weight_decay=cfg.weight_decay)
+        else:
+            raise NotImplementedError
+        
+        warmup_iter = int(np.round(cfg.warmup_percentage * self.trainer.estimated_stepping_batches))
+
+        if cfg.lr_scheduler_mode == 'cosine':
+            warmup_scheduler = LambdaLR(optimizer,
+                                        lr_lambda=warmup_lambda(warmup_steps=warmup_iter,
+                                                                min_lr_ratio=cfg.warmup_min_lr_ratio))
+            cosine_scheduler = CosineAnnealingLR(optimizer,
+                                                 T_max=(self.trainer.estimated_stepping_batches - warmup_iter),
+                                                 eta_min=cfg.min_lr_ratio * cfg.lr)
+            lr_scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+                                        milestones=[warmup_iter])
+            lr_scheduler_config = {
+                'scheduler': lr_scheduler,
+                'interval': 'step',
+                'frequency': 1,
+            }
+
+            return {'optimizer': optimizer, 'lr_scheduler': lr_scheduler_config}
+        else:
+            return {'optimizer': optimizer}
+
+    def forward(self, in_seq, out_seq):
+        output = self.torch_nn_module(in_seq)
+        loss = self.criterion(output, out_seq)
+
+        return output, loss
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+
+        # Shape (B, C, T, W, H) -> Earthformer Shape (B, T, W, H, C)
+        x = x.permute(0, 2, 3, 4, 1).contiguous()
+        y = y.permute(0, 2, 3, 4, 1).contiguous()
+
+        y_hat, loss = self(x, y)
+
+        loss_mse = F.mse_loss(y_hat[:,:,:,:,0], y[:,:,:,:,0])
+
+        self.log('train/loss_mse', loss_mse,
+                prog_bar=True,
+                on_step=True,
+                on_epoch=True,  
+                logger=True,
+                sync_dist=True)
+
+        self.log('train/loss', loss,
+                prog_bar=True,
+                on_step=True,
+                on_epoch=True,  
+                logger=True,
+                sync_dist=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+
+        # Shape (B, C, T, W, H) -> Earthformer Shape (B, T, W, H, C)
+        x = x.permute(0, 2, 3, 4, 1).contiguous()
+        y = y.permute(0, 2, 3, 4, 1).contiguous()
+
+        y_hat, loss = self(x, y)
+
+        if y_hat.shape[-1] != 1:
+            y_hat = y_hat[..., 0:1]
+            y = y[..., 0:1]
+
+        loss_mse = F.mse_loss(y_hat, y)
+
+        y_mmh = self.to_mmh(y.clone())
+        y_hat_mmh = self.to_mmh(y_hat.clone())
+
+        step_mse = self.valid_r_mse(y_hat_mmh, y_mmh)
+        step_mae = self.valid_r_mae(y_hat_mmh, y_mmh)
+        step_csi = self.valid_r_csi_20mmh(y_hat_mmh, y_mmh)
+
+        self.log('val/loss', loss_mse,
+                prog_bar=True,
+                on_epoch=True,
+                on_step=False,
+                logger=True,
+                sync_dist=True)
+
+        self.log('val/loss_balanced', loss,
+                prog_bar=True,
+                on_epoch=True,
+                on_step=False,
+                logger=True,
+                sync_dist=True)
+
+        if self.global_rank == 0 and batch_idx in {31, 127}:
+            # Select two representative samples for TensorBoard:
+            # - extreme: highest peak intensity in the batch
+            # - reference: fixed mid-batch sample for stable comparison
+            y_mmh_batch = self.to_mmh(y.detach())
+            batch_peak = y_mmh_batch.max(dim=1).values.max(dim=1).values.max(dim=1).values
+            extreme_idx = int(torch.argmax(batch_peak).item())
+            reference_idx = x.shape[0] // 2
+
+            sample_specs = {
+                f"batch{batch_idx}_extreme": extreme_idx,
+                f"batch{batch_idx}_reference": reference_idx,
+            }
+
+            for tag, sample_idx in sample_specs.items():
+                input_img = x[sample_idx].permute(0, 3, 1, 2).detach().cpu()
+                target_img = y[sample_idx].permute(0, 3, 1, 2).detach().cpu()
+                pred_img = y_hat[sample_idx].permute(0, 3, 1, 2).detach().cpu()
+                self.sample_images[tag] = (input_img, target_img, pred_img)
+
+        return loss_mse
+
+    def to_mmh(self, img, norm_method='zscore', mean=0.03019706713265408, std=0.5392297631902654):
+        """
+        Convert normalized precipitation data to mm/h.
+
+        Parameters:
+            img (np.ndarray or torch.Tensor): Normalized input data.
+            norm_method (str): 'zscore' or 'minmax'.
+            mean (float): Mean for z-score normalization.
+            std (float): Std for z-score normalization.
+
+        Returns:
+            img_mmh: Precipitation in mm/h (clipped to [0, 160]).
+        """
+        if norm_method == 'zscore':
+            img = img * std + mean
+            img_mmh = 10 ** img
+
+        elif norm_method == 'minmax':
+            # Undo minmax normalization to [0, 55] dBZ
+            img = img * 55
+
+            # Convert from dBZ to mm/h (in-place)
+            if isinstance(img, np.ndarray):
+                mask = img != 0
+                img[mask] = ((10**(img[mask] / 10) - 1) / 200) ** (5 / 8)
+            elif isinstance(img, torch.Tensor):
+                mask = img != 0
+                img[mask] = ((10**(img[mask] / 10) - 1) / 200) ** (5 / 8)
+            else:
+                raise TypeError("Input must be a numpy array or a torch tensor")
+
+            img_mmh = img
+
+        else:
+            raise ValueError("norm_method must be 'zscore' or 'minmax'")
+
+        # Clip final mm/h values to physical range
+        if isinstance(img_mmh, torch.Tensor):
+            img_mmh = torch.clamp(img_mmh, 0.0, 160.0)
+        elif isinstance(img_mmh, np.ndarray):
+            img_mmh = np.clip(img_mmh, 0.0, 160.0)
+
+        return img_mmh
+
+    def get_colormap(self, name):
+        if name == 'mmh':
+            reds = "#7D7D7D", "#640064", "#AF00AF", "#DC00DC", "#3232C8", "#0064FF", \
+                "#009696", "#00C832", "#64FF00", "#96FF00", "#C8FF00", "#FFFF00", \
+                "#FFC800", "#FFA000", "#FF7D00", "#E11900"
+            clevs = [0.08, 0.16, 0.25, 0.40, 0.63, 1, 1.6, 2.5, 4, 6.3, 10, 16, 25, 40, 63, 100, 160]
+            cmap = matplotlib.colors.ListedColormap(reds)
+            norm = matplotlib.colors.BoundaryNorm(clevs, len(reds))
+            return cmap, norm
+        cmap = matplotlib.colormaps.get(name)
+        if cmap is None:
+            raise ValueError(f"Unknown colormap: {name}")
+        return cmap, None
+
+    def _apply_colormap(self, img, cmap="mmh", ):
+        """
+        Apply a matplotlib colormap (including 'mmh') to a Z-scored log10 rain rate image.
+
+        img: (H, W) torch.Tensor in z-score space.
+        Returns: (3, H, W) torch.Tensor in uint8 RGB.
+        """
+        img_np = img.numpy()
+
+        img_np = self.to_mmh(img_np)
+
+        # Get colormap and norm
+        cmap_obj, norm_obj = self.get_colormap(cmap)
+
+        if norm_obj is not None:
+            img_colored = cmap_obj(norm_obj(img_np))[:, :, :3]
+        else:
+            # Fallback to normal continuous colormap
+            img_min, img_max = img_np.min(), img_np.max()
+            img_norm = (img_np - img_min) / (img_max - img_min) if img_max > img_min else np.zeros_like(img_np)
+            img_colored = cmap_obj(img_norm)[:, :, :3]
+
+        img_colored = (img_colored * 255).astype(np.uint8)
+        img_colored = torch.from_numpy(img_colored).permute(2, 0, 1)  # (C, H, W)
+
+        return img_colored
+
+    def on_validation_epoch_end(self):
+
+        valid_mse = self.valid_r_mse.compute()
+        valid_mae = self.valid_r_mae.compute()
+        valid_csi = self.valid_r_csi_20mmh.compute()
+        self.log_dict({'mse_r': valid_mse, 'mae_r': valid_mae, 'csi_20mmh': valid_csi},
+                        prog_bar=True,
+                        on_epoch=True,
+                        on_step=False,
+                        logger=True,
+                        sync_dist=True)
+        self.valid_r_mse.reset()
+        self.valid_r_mae.reset()
+        self.valid_r_csi_20mmh.reset()
+
+        if self.sample_images and self.global_rank == 0:
+            for sample_tag, (input_img, target_img, pred_img) in self.sample_images.items():
+                # Get dimensions
+                _, C, _, _ = input_img.shape
+                if C > 1:
+                    input_img = input_img[:, :1, :, :]
+
+                T_out = target_img.shape[0]
+                last_input = input_img[-1].squeeze()  # (H, W)
+
+                interleaved = []
+                for t in range(T_out):
+                    interleaved.append(target_img[t].squeeze())  # (H, W)
+                    interleaved.append(pred_img[t].squeeze())    # (H, W)
+
+                all_frames = [last_input] + interleaved
+                all_frames_colored = [self._apply_colormap(frame) for frame in all_frames]
+                all_frames_colored = torch.stack(all_frames_colored)  # (N, 3, H, W)
+                grid = torchvision.utils.make_grid(all_frames_colored, nrow=len(all_frames_colored))
+
+                self.logger.experiment.add_image(
+                    f"forecast_samples_colored/{sample_tag}",
+                    grid,
+                    global_step=self.current_epoch,
+                )
+
+            self.sample_images = {}

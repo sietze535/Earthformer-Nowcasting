@@ -1,0 +1,190 @@
+dataloader:
+  module_path: nowcasting.data.dataloader_zarrv3.NowcastingDataModule
+  paths:
+  - ${oc.env:THESIS_DATA_ROOT}/radar_2008_2019_radar_only_v1.zarr
+  var_info:
+    sample_var: radar/max_intensity_grid
+    latlon: false
+    in_vars:
+    - radar/rtcor
+    out_vars:
+    - radar/rtcor
+    transforms:
+      radar:
+        default_rainrate:
+          mean: 0.03019706713265408
+          std: 0.5392297631902654
+  split_info:
+    split_rules:
+      test:
+        year:
+        - 2019
+      val:
+        year:
+        - 2018
+      train:
+        year:
+        - 2008
+        - 2009
+        - 2010
+        - 2011
+        - 2012
+        - 2013
+        - 2014
+        - 2015
+        - 2016
+        - 2017
+    apply_missing_masks:
+    - radar
+    clutter_threshold: 50
+  sample_info:
+    threshold: 0.01
+    methods:
+      train:
+        agg: mean_pool
+        center_crop: true
+      val:
+        agg: mean_pool
+        center_crop: true
+      test:
+        agg: mean_pool
+        center_crop: true
+    index_files:
+      train: ${oc.env:THESIS_INDEX_DIR}/train_025pct.npz
+      val: ${oc.env:THESIS_INDEX_DIR}/val_2018.npz
+      test: ${oc.env:THESIS_INDEX_DIR}/test_2019.npz
+  context_len: 4
+  forecast_len: 18
+  img_size:
+  - 8
+  - 8
+  stride:
+  - 4
+  - 1
+  - 1
+  batch_size: 8
+  num_workers: 6
+trainer:
+  max_epochs: 60
+  accelerator: auto
+  strategy: auto
+  precision: 16-mixed
+  profiler: null
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 2
+  check_val_every_n_epoch: null
+  val_check_interval: 1000
+  limit_val_batches: 0.2
+  num_sanity_val_steps: 0
+logger:
+  save_dir: ./results/tb_logs_thesis_scaling_v1
+  name: thesis_scaling_v1__radar__025pct
+callbacks:
+  checkpoint:
+    monitor: null
+    save_top_k: -1
+    save_last: true
+    every_n_train_steps: 2000
+    save_on_train_epoch_end: false
+    mode: min
+  early_stopping:
+    monitor: val/loss
+    min_delta: 0.0
+    patience: 20
+    verbose: true
+    mode: min
+optimizer:
+  method: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+  lr_scheduler_mode: cosine
+  min_lr_ratio: 0.001
+  warmup_min_lr_ratio: 0.0
+  warmup_percentage: 0.2
+loss:
+  loss_name: balanced
+  normalization: zscore
+  mean_log_rain: 0.03019706713265408
+  std_log_rain: 0.5392297631902654
+  max_weight_r: 30
+  weight_intensity: 1.0
+  extended: true
+model:
+  module_path: nowcasting.models.earthformer.earthformer.CuboidSEVIRPLModule
+  checkpoint_path: null
+  compile: false
+  input_shape:
+  - 4
+  - 256
+  - 256
+  - 1
+  target_shape:
+  - 18
+  - 256
+  - 256
+  - 1
+  base_units: 128
+  block_units: null
+  scale_alpha: 1.0
+  enc_depth:
+  - 1
+  - 1
+  dec_depth:
+  - 1
+  - 1
+  enc_use_inter_ffn: true
+  dec_use_inter_ffn: true
+  dec_hierarchical_pos_embed: false
+  downsample: 2
+  downsample_type: patch_merge
+  upsample_type: upsample
+  num_global_vectors: 8
+  use_dec_self_global: false
+  dec_self_update_global: true
+  use_dec_cross_global: false
+  use_global_vector_ffn: false
+  use_global_self_attn: true
+  separate_global_qkv: true
+  global_dim_ratio: 1
+  enc_attn_patterns: axial
+  dec_self_attn_patterns: axial
+  dec_cross_attn_patterns: cross_1x1
+  dec_cross_last_n_frames: null
+  attn_drop: 0.1
+  proj_drop: 0.1
+  ffn_drop: 0.1
+  num_heads: 4
+  ffn_activation: gelu
+  gated_ffn: false
+  norm_layer: layer_norm
+  padding_type: zeros
+  pos_embed_type: t+h+w
+  use_relative_pos: true
+  self_attn_use_final_proj: true
+  dec_use_first_self_attn: false
+  z_init_method: zeros
+  checkpoint_level: 0
+  initial_downsample_type: stack_conv
+  initial_downsample_activation: leaky
+  initial_downsample_stack_conv_num_layers: 3
+  initial_downsample_stack_conv_dim_list:
+  - 16
+  - 64
+  - 128
+  initial_downsample_stack_conv_downscale_list:
+  - 3
+  - 2
+  - 2
+  initial_downsample_stack_conv_num_conv_list:
+  - 2
+  - 2
+  - 2
+  attn_linear_init_mode: '0'
+  ffn_linear_init_mode: '0'
+  conv_init_mode: '0'
+  down_up_linear_init_mode: '0'
+  norm_init_mode: '0'
+eval:
+  model_name: thesis_scaling_v1__radar__025pct
+  num_samples: 32000

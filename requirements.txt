@@ -1,0 +1,25 @@
+numpy
+numba
+pandas
+matplotlib
+torch
+torchvision
+torchmetrics
+einops
+lightning
+zarr
+netcdf4
+xarray
+dask
+fire
+omegaconf
+tqdm
+h5py
+scipy
+scikit-image
+tensorboard
+codecarbon
+requests
+# Classical baselines (optional extra environment):
+# pysteps
+# opencv-python-headless
