@@ -4,6 +4,10 @@ This is a code release for the MSc thesis: Thermodynamic Context in Earthformer 
 AWS→IDW auxiliary-grid builders, classical baselines, and the exact 2019 test
 indices used in the reported numbers.
 
+![AWS stations → IDW temperature grid → aligned early-fusion patch](docs/figures/thermo_grid_schematic.png)
+
+*Thermodynamic auxiliary construction (thesis Fig.): (a) KNMI AWS temperatures, (b) IDW-gridded \(T\) on the \(768\times704\) radar domain with a \(256\times256\) patch, (c) early-fusion input \([\log_{10}R,\,T,\,T_D]\).*
+
 This is mostly a reduced fork of Mats Robben’s [`nowcasting`](https://github.com/MatsRobben/nowcasting) package (EarthFormer + KNMI Zarr dataloader) and unused models (DGMR, LDCast, FiLM/VSN variants, satelite pipelines) are omitted.
 
 ## What is in this repo
